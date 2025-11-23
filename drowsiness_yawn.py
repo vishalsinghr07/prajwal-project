@@ -1,32 +1,93 @@
-#python drowniness_yawn.py --webcam webcam_index
+#python drowsiness_yawn.py --webcam webcam_index
 
 from scipy.spatial import distance as dist
 from imutils.video import VideoStream
 from imutils import face_utils
-from threading import Thread
+from threading import Thread, Lock
 import numpy as np
 import argparse
 import imutils
 import time
-import dlib
 import cv2
-import playsound
 import os
+import sys
 
+# Try to import dlib
+try:
+    import dlib
+except ImportError:
+    print("=" * 60)
+    print("ERROR: dlib is not installed!")
+    print("=" * 60)
+    print("dlib requires cmake to build. Please install cmake first:")
+    print("1. Download cmake from: https://cmake.org/download/")
+    print("2. Install cmake and add it to your PATH")
+    print("3. Restart your terminal")
+    print("4. Run: pip install dlib")
+    print("=" * 60)
+    sys.exit(1)
+
+# Try to import playsound, fallback to pygame
+try:
+    import playsound
+    USE_PLAYSOUND = True
+except ImportError:
+    try:
+        import pygame
+        pygame.mixer.init()
+        USE_PLAYSOUND = False
+        print("-> Using pygame for audio (playsound not available)")
+    except ImportError:
+        print("-> WARNING: No audio library available. Alarm sounds will be disabled.")
+        USE_PLAYSOUND = None
+
+
+# Thread-safe alarm management
+alarm_lock = Lock()
+alarm_status = False
+alarm_status2 = False
+saying = False
+COUNTER = 0
 
 def sound_alarm(path):
+    """Play alarm sound in a separate thread"""
     global alarm_status
     global alarm_status2
     global saying
 
-    while alarm_status:
-        print('call')
-        playsound.playsound(path)
-    if alarm_status2:
-        print('call')
-        saying = True
-        playsound.playsound(path)
-        saying = False
+    try:
+        if USE_PLAYSOUND:
+            while alarm_status:
+                print('Drowsiness Alert - Playing alarm')
+                playsound.playsound(path)
+            if alarm_status2:
+                print('Yawn Alert - Playing alarm')
+                with alarm_lock:
+                    saying = True
+                playsound.playsound(path)
+                with alarm_lock:
+                    saying = False
+        elif USE_PLAYSOUND is False:  # Using pygame
+            while alarm_status:
+                print('Drowsiness Alert - Playing alarm')
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    pygame.time.wait(100)
+            if alarm_status2:
+                print('Yawn Alert - Playing alarm')
+                with alarm_lock:
+                    saying = True
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    pygame.time.wait(100)
+                with alarm_lock:
+                    saying = False
+        else:
+            print("Audio not available - alarm would play here")
+    except Exception as e:
+        print(f"Error playing alarm: {e}")
 
 def eye_aspect_ratio(eye):
     A = dist.euclidean(eye[1], eye[5])
@@ -68,104 +129,159 @@ def lip_distance(shape):
 ap = argparse.ArgumentParser()
 ap.add_argument("-w", "--webcam", type=int, default=0,
                 help="index of webcam on system")
-ap.add_argument("-a", "--alarm", type=str, default="D:\Files\last desktop\Drowsiness-Detection-System\Alert.WAV", help="path alarm .WAV file")
+ap.add_argument("-a", "--alarm", type=str, default="Alert.wav", 
+                help="path to alarm .WAV file")
 args = vars(ap.parse_args())
 
+# Configuration constants
 EYE_AR_THRESH = 0.3
 EYE_AR_CONSEC_FRAMES = 30
 YAWN_THRESH = 20
-alarm_status = False
-alarm_status2 = False
-saying = False
-COUNTER = 0
+
+# Check for required files
+CASCADE_FILE = "haarcascade_frontalface_default.xml"
+PREDICTOR_FILE = "shape_predictor_68_face_landmarks.dat"
+ALARM_FILE = args["alarm"]
 
 print("-> Loading the predictor and detector...")
-#detector = dlib.get_frontal_face_detector()
-detector = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")    #Faster but less accurate
-predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
 
+# Check if cascade file exists
+if not os.path.exists(CASCADE_FILE):
+    print(f"ERROR: {CASCADE_FILE} not found!")
+    sys.exit(1)
+
+# Check if predictor file exists
+if not os.path.exists(PREDICTOR_FILE):
+    print(f"ERROR: {PREDICTOR_FILE} not found!")
+    sys.exit(1)
+
+# Check if alarm file exists
+if not os.path.exists(ALARM_FILE):
+    print(f"WARNING: Alarm file {ALARM_FILE} not found. Alarm will be disabled.")
+    ALARM_FILE = ""
+
+try:
+    detector = cv2.CascadeClassifier(CASCADE_FILE)
+    if detector.empty():
+        raise ValueError(f"Failed to load {CASCADE_FILE}")
+    predictor = dlib.shape_predictor(PREDICTOR_FILE)
+    print("-> Files loaded successfully")
+except Exception as e:
+    print(f"ERROR loading files: {e}")
+    sys.exit(1)
 
 print("-> Starting Video Stream")
-vs = VideoStream(src=args["webcam"]).start()
-#vs= VideoStream(usePiCamera=True).start()       //For Raspberry Pi
-time.sleep(1.0)
+try:
+    vs = VideoStream(src=args["webcam"]).start()
+    time.sleep(1.0)
+    # Test if camera is working
+    test_frame = vs.read()
+    if test_frame is None:
+        raise ValueError("Cannot read from camera")
+    print("-> Camera initialized successfully")
+except Exception as e:
+    print(f"ERROR initializing camera: {e}")
+    print("Make sure the camera is connected and not being used by another application.")
+    sys.exit(1)
 
-while True:
+alarm_thread = None
 
-    frame = vs.read()
-    frame = imutils.resize(frame, width=450)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+try:
+    while True:
+        frame = vs.read()
+        if frame is None:
+            print("ERROR: Failed to read frame from camera")
+            break
+            
+        frame = imutils.resize(frame, width=450)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    #rects = detector(gray, 0)
-    rects = detector.detectMultiScale(gray, scaleFactor=1.1,
-		minNeighbors=5, minSize=(30, 30),
-		flags=cv2.CASCADE_SCALE_IMAGE)
+        rects = detector.detectMultiScale(gray, scaleFactor=1.1,
+                                          minNeighbors=5, minSize=(30, 30),
+                                          flags=cv2.CASCADE_SCALE_IMAGE)
 
-    #for rect in rects:
-    for (x, y, w, h) in rects:
-        rect = dlib.rectangle(int(x), int(y), int(x + w),int(y + h))
+        for (x, y, w, h) in rects:
+            rect = dlib.rectangle(int(x), int(y), int(x + w), int(y + h))
 
-        shape = predictor(gray, rect)
-        shape = face_utils.shape_to_np(shape)
+            try:
+                shape = predictor(gray, rect)
+                shape = face_utils.shape_to_np(shape)
 
-        eye = final_ear(shape)
-        ear = eye[0]
-        leftEye = eye [1]
-        rightEye = eye[2]
+                eye = final_ear(shape)
+                ear = eye[0]
+                leftEye = eye[1]
+                rightEye = eye[2]
 
-        distance = lip_distance(shape)
+                distance = lip_distance(shape)
 
-        leftEyeHull = cv2.convexHull(leftEye)
-        rightEyeHull = cv2.convexHull(rightEye)
-        cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
-        cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
+                leftEyeHull = cv2.convexHull(leftEye)
+                rightEyeHull = cv2.convexHull(rightEye)
+                cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
+                cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
 
-        lip = shape[48:60]
-        cv2.drawContours(frame, [lip], -1, (0, 255, 0), 1)
+                lip = shape[48:60]
+                cv2.drawContours(frame, [lip], -1, (0, 255, 0), 1)
 
-        if ear < EYE_AR_THRESH:
-            COUNTER += 1
+                if ear < EYE_AR_THRESH:
+                    COUNTER += 1
 
-            if COUNTER >= EYE_AR_CONSEC_FRAMES:
-                if alarm_status == False:
-                    alarm_status = True
-                    if args["alarm"] != "":
-                        t = Thread(target=sound_alarm,
-                                   args=(args["alarm"],))
-                    t.deamon = True
-                    t.start()
+                    if COUNTER >= EYE_AR_CONSEC_FRAMES:
+                        with alarm_lock:
+                            if alarm_status == False:
+                                alarm_status = True
+                                if ALARM_FILE != "":
+                                    alarm_thread = Thread(target=sound_alarm,
+                                                         args=(ALARM_FILE,))
+                                    alarm_thread.daemon = True
+                                    alarm_thread.start()
 
-                cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
+                        cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                else:
+                    COUNTER = 0
+                    with alarm_lock:
+                        alarm_status = False
+
+                if distance > YAWN_THRESH:
+                    cv2.putText(frame, "Yawn Alert", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    with alarm_lock:
+                        if alarm_status2 == False and saying == False:
+                            alarm_status2 = True
+                            if ALARM_FILE != "":
+                                alarm_thread = Thread(target=sound_alarm,
+                                                     args=(ALARM_FILE,))
+                                alarm_thread.daemon = True
+                                alarm_thread.start()
+                else:
+                    with alarm_lock:
+                        alarm_status2 = False
+
+                cv2.putText(frame, "EAR: {:.2f}".format(ear), (300, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-        else:
-            COUNTER = 0
-            alarm_status = False
-
-        if (distance > YAWN_THRESH):
-                cv2.putText(frame, "Yawn Alert", (10, 30),
+                cv2.putText(frame, "YAWN: {:.2f}".format(distance), (300, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                if alarm_status2 == False and saying == False:
-                    alarm_status2 = True
-                    if args["alarm"] != "":
-                        t = Thread(target=sound_alarm,
-                                   args=(args["alarm"],))
-                    t.deamon = True
-                    t.start()
-        else:
-            alarm_status2 = False
+            except Exception as e:
+                print(f"Error processing face: {e}")
+                continue
 
-        cv2.putText(frame, "EAR: {:.2f}".format(ear), (300, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.putText(frame, "YAWN: {:.2f}".format(distance), (300, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(frame, "Press 'q' to quit", (10, frame.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.imshow("Frame", frame)
+        key = cv2.waitKey(1) & 0xFF
 
+        if key == ord("q"):
+            break
 
-    cv2.imshow("Frame", frame)
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == ord("q"):
-        break
-
-cv2.destroyAllWindows()
-vs.stop()
+except KeyboardInterrupt:
+    print("\n-> Interrupted by user")
+except Exception as e:
+    print(f"ERROR during execution: {e}")
+finally:
+    print("-> Cleaning up...")
+    with alarm_lock:
+        alarm_status = False
+        alarm_status2 = False
+    cv2.destroyAllWindows()
+    vs.stop()
+    print("-> Exiting")
